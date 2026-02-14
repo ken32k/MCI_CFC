@@ -68,3 +68,13 @@ Repository Highlights
 - `proc_mat/`: structural/functional matrix preprocessing, harmonization, QC.
 - `WMHseg/`: shell wrappers around LST / SynthSeg lesion workflows.
 - `preprocessing/`: preprocessing for BOLD and DTI.
+
+
+## Main dependencies
+
+| Software           | Version | Links                                          |
+| ------------------ | ------- | ---------------------------------------------- |
+| Micapipe           | 0.2.3   | https://github.com/MICA-MNI/micapipe           |
+| Bayesian VLSM      |         | https://github.com/MariePittet/Bayesian_VLSM_R |
+| Dominance analysis | 1.1.9   | https://github.com/dominance-analysis          |
+| Pingouin           | 0.5.5   | https://pingouin-stats.org                     |
