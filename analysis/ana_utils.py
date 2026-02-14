@@ -1,50 +1,80 @@
-# use anaconda python 3.8 base on local machine
-# use miniconda python 3.11.5 on cluster
+"""Analysis utilities for the MCI_CFC project."""
 
+from __future__ import annotations
+
+import datetime
+import glob
+import logging
+import os
+import pickle
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+from networkx import *  # noqa: F401,F403 - legacy re-export relied upon downstream
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import os, sys, glob, datetime
-from matplotlib import pyplot as plt
-import matplotlib.colors as mcolors
-import scipy as sp
-
 from matplotlib import colors as mcolors
+from matplotlib import pyplot as plt
 from nilearn import plotting
 import pingouin as pg
-import pickle
+import scipy as sp
 from scipy.stats import f_oneway
 import statsmodels.api as sm
 from tqdm import trange
 from joblib import Parallel, delayed
 from PIL import Image, ImageFont, ImageDraw
+from statsmodels.formula.api import ols
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from statsmodels.stats.multitest import multipletests
-from statsmodels.formula.api import ols
 from sklearn.linear_model import LinearRegression
 from neuroCombat import neuroCombat
 
 # brainspace modules
-from brainspace.utils.parcellation import map_to_labels
-from brainspace.datasets import load_group_fc, load_parcellation
+from brainspace.datasets import load_conte69, load_group_fc, load_parcellation
 from brainspace.plotting import plot_hemispheres
-from brainspace.datasets import load_conte69
+from brainspace.utils.parcellation import map_to_labels
+
+try:  # Optional dependency used in dominance analysis helpers
+    from netneurotools.stats import get_dominance_stats
+except ImportError:  # pragma: no cover - handled at runtime if unavailable
+    get_dominance_stats = None
+
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
 # from netneurotools.stats import get_dominance_stats
 
 
 global PROJ_HOME, DISGROUPS, SUB_ID_LIST, SUB_ID_DIAG_DICT, WMH_LAB, WMH_LAB4, ATLAS, NNODE, TRIU_IDX, COV_TBL, SUB_INFO_DF
 
-# Project directory
-PROJ_HOME = os.path("D:/Shanghaitec/PROJECT/CSVD_neo")
+
+def _resolve_project_home() -> Path:
+    env_override = os.environ.get("MCI_CFC_HOME")
+    base = Path(env_override or "D:/Shanghaitec/PROJECT/CSVD_neo")
+    try:
+        return base.expanduser().resolve()
+    except OSError:
+        logger.warning("Falling back to non-resolved project path: %s", base)
+        return base
+
+
+PROJ_PATH = _resolve_project_home()
+PROJ_HOME = str(PROJ_PATH)
+DATA_DIR = PROJ_PATH / "data"
+PARC_DIR = PROJ_PATH / "parc"
 
 # Node and matrix definition
 NNODE = 200
 ATLAS = f"schaefer-{NNODE}"
 TRIU_IDX = np.triu_indices(NNODE, 1)
 
-N_JOBS = 6
+N_JOBS_DEFAULT = 6
+N_JOBS = int(os.environ.get("MCI_CFC_N_JOBS", N_JOBS_DEFAULT))
 
-sub_data_csv = os.path.join(PROJ_HOME, "data", "huashan_renji_merge.csv")
+sub_data_csv = DATA_DIR / "huashan_renji_merge.csv"
 diag_col = "Group"
 
 DISGROUPS = ["aMCI", "naMCI", "NCI"]
@@ -59,36 +89,64 @@ mean_diff_lab = [
 CM_ARR = [
     ("sc-wei", 0, "#999999"),
     ("co-wei", 0, "#9A7BB7"),
-    ("fg-wei", 3, "#9A7BB7"),
-    ("pt-wei", 3, "#7B8CB7"),
-    ("si-wei", 3, "#7B8CB7"),
-    ("pl-wei", 3, "#999999"),
+    ("fg-wei", 2, "#9A7BB7"),
+    ("pt-wei", 2, "#7B8CB7"),
+    ("si-wei", 2, "#7B8CB7"),
+    ("pl-wei", 2, "#999999"),
 ]
 
-CM_LAB_ARR = [cm[0] for cm in CM_ARR[1:]]
+CM_LABS = [cm[0] for cm in CM_ARR[1:]]
 CM_ARR_SHORT = [cm[0][:2].upper() for cm in CM_ARR[1:]]
 CM_ARR_COLOR = [cm[2] for cm in CM_ARR[1:]]
 
 # Lesion map (LM)
-LM_LAB = ["wb", "int", "wmh"]
+TRACT_LABS = ["wb", "int", "wmh"]
 PAL4 = ["#FA7F6f", "#FFBE7A", "#82B0D2"]
 
-# Clinical information
-SUB_INFO_DF = pd.read_csv(sub_data_csv, encoding="gbk")
-SUB_INFO_DF = SUB_INFO_DF[SUB_INFO_DF["Group"].isin(DISGROUPS)]
-print("Subjects from Excel: ", len(SUB_INFO_DF))
+def _read_csv_with_encodings(path: Path, encodings: Iterable[str] = ("gbk", "utf-8", "utf-8-sig"), **kwargs) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for encoding in encodings:
+        try:
+            return pd.read_csv(path, encoding=encoding, **kwargs)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    raise FileNotFoundError(path)
 
-# Get subject list
-sub_list_file = f"{PROJ_HOME}/data/sub_list.csv"
-if os.path.exists(sub_list_file):
-    SUB_ID_LIST = pd.read_csv(sub_list_file, encoding="gbk")["pid"].to_list()
-else:
-    SUB_ID_LIST = list(set(SUB_INFO_DF.pid.tolist()))
 
-# Filter SUB_INFO_DF
-SUB_INFO_DF = SUB_INFO_DF[SUB_INFO_DF["pid"].isin(SUB_ID_LIST)]
-SUB_INFO_DF["genderv"] = SUB_INFO_DF["gender"].replace({"M": 0, "F": 1})
-SUB_INFO_DF.to_csv(f"{PROJ_HOME}/data/filt_sub_info.csv", encoding="gbk")
+def _load_subject_dataframe() -> pd.DataFrame:
+    df = _read_csv_with_encodings(sub_data_csv)
+    df = df[df["Group"].isin(DISGROUPS)].copy()
+    logger.info("Subjects from Excel: %s", len(df))
+    return df
+
+
+def _load_subject_ids(candidate_df: pd.DataFrame) -> List[str]:
+    sub_list_file = DATA_DIR / "sub_list.csv"
+    if sub_list_file.exists():
+        ids = _read_csv_with_encodings(sub_list_file)["pid"].to_list()
+        if ids:
+            return ids
+    logger.warning("Subject list file missing or empty, falling back to dataframe IDs")
+    return sorted(set(candidate_df["pid"].to_list()))
+
+
+def _finalize_subject_info(raw_df: pd.DataFrame, subject_ids: List[str]) -> pd.DataFrame:
+    df = raw_df[raw_df["pid"].isin(subject_ids)].copy()
+    if "gender" in df.columns:
+        df["genderv"] = df["gender"].replace({"M": 0, "F": 1})
+    output_csv = DATA_DIR / "filt_sub_info.csv"
+    try:
+        df.to_csv(output_csv, encoding="gbk", index=False)
+    except Exception:
+        logger.exception("Failed to write filtered subject info to %s", output_csv)
+    return df
+
+
+_RAW_SUB_INFO = _load_subject_dataframe()
+SUB_ID_LIST = _load_subject_ids(_RAW_SUB_INFO)
+SUB_INFO_DF = _finalize_subject_info(_RAW_SUB_INFO, SUB_ID_LIST)
 
 # Get the diagnosis dictionary
 SUB_ID_DIAG_DICT = SUB_INFO_DF.set_index("pid")["Group"].to_dict()
@@ -101,73 +159,67 @@ value_counts = {
     value: sum(1 for v in SUB_ID_DIAG_DICT.values() if v == value)
     for value in set(SUB_ID_DIAG_DICT.values())
 }
-print(
-    "SUB_ID_LIST: list, format is like this: ",
-    SUB_ID_LIST[0],
-    ", and total length of SUB_ID_LIST =",
-    len(SUB_ID_LIST),
-    value_counts,
-)
 
 
-def add_statistic_annotation(p_vals):
-    """
-        Add statistical annotation based on p-values.
-        Args:
-            p_vals (float or list): A single p-value or a list of p-values.
-        Returns:
-            list or str: Statistical annotations as a list (if input is a list) or a string (if input is a float).
-    """
-    def annotate(p):
+def add_statistic_annotation(p_vals: Sequence[float]) -> List[str]:
+    """Return formatted significance annotations for each p-value."""
+
+    def annotate(p: float) -> str:
         if p < 0.001:
             return "< 0.001***"
-        elif p < 0.01:
-            return f"{p}**"
-        elif p < 0.05:
-            return f"{p}*"
-        else:
-            return f"{p}"
+        if p < 0.01:
+            return f"{p:.3f}**"
+        if p < 0.05:
+            return f"{p:.3f}*"
+        return f"{p:.3f}"
 
-    if isinstance(p_vals, list):
-        return [annotate(p) for p in p_vals]
-    elif isinstance(p_vals, (float, int)):
-        return annotate(p_vals)
-    else:
-        raise ValueError("p_vals must be a float, int, or a list of floats/ints.")
+    return [annotate(float(p)) for p in p_vals]
 
 
-def sub_mat_correlatrion(fc, sc):
+def get_stats_sig(p: float) -> str:
+    """Map a p-value onto the conventional star-based significance label."""
+
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    return ""
+
+
+def sub_mat_correlatrion(fc: np.ndarray, sc: np.ndarray) -> Tuple[float, float]:
+    """Compute Pearson correlation between FC and SC/CM matrices.
+
+    Args:
+        fc: Functional connectivity values (2D matrix or upper-triangle vector).
+        sc: Structural/communication matrix with same geometry as fc.
+
+    Returns:
+        Tuple of (r, p) Pearson correlation results.
     """
-    Calculate the rsq of fc and matrices correlations
-    FC should be inputed before SC!!!
-    """
 
-    # If 2D array, then select upper triangle and flatten
-    if sc.shape == (NNODE, NNODE):
-        fc, sc = (
-            fc[np.triu_indices(fc.shape[0], k=1)],
-            sc[np.triu_indices(sc.shape[0], k=1)],
-        )
+    fc_arr = np.asarray(fc)
+    sc_arr = np.asarray(sc)
 
-    # Replace inf and 0 values with nan in sc
-    sc = np.where(np.isinf(sc), 0, sc)
+    if sc_arr.shape == (NNODE, NNODE):
+        idx = np.triu_indices(sc_arr.shape[0], k=1)
+        fc_arr = fc_arr[idx]
+        sc_arr = sc_arr[idx]
 
-    # Remove Nans according to nans in sc
-    fc, sc = fc[~np.isnan(sc)], sc[~np.isnan(sc)]
+    sc_arr = np.where(np.isinf(sc_arr), np.nan, sc_arr)
+    valid_mask = ~np.isnan(sc_arr)
+    fc_arr = fc_arr[valid_mask]
+    sc_arr = sc_arr[valid_mask]
 
-    # Z score (unnecessary)
-    # fc = sp.stats.zscore(fc)
-    # sc = sp.stats.zscore(sc)
+    if fc_arr.size == 0 or sc_arr.size == 0:
+        return np.nan, np.nan
 
-    # pearson correlation
-    r, p = sp.stats.pearsonr(fc, sc)
-    # spearman correlation (not recommended)
-    # r, p = sp.stats.spearmanr(fc, sc)
-
+    r, p = sp.stats.pearsonr(fc_arr, sc_arr)
     return r, p
 
 
-def sub_mat_linear_reg(fc, cms):
+def sub_cfc_lr(fc, cms):
     """
     Calculate the adjusted Rsq and total dominance of functional connectome
     and communication matrices correlations for upper triangle.
@@ -177,9 +229,14 @@ def sub_mat_linear_reg(fc, cms):
         cms (numpy.ndarray): 2D array representing communication matrices
 
     Returns:
-        list: Adjusted Rsq, total dominance
+        tuple: total dominance, adjusted Rsq list, number of NaN indices
     """
-    # Linear regression
+    if get_dominance_stats is None:
+        raise ImportError(
+            "netneurotools.stats.get_dominance_stats is required for sub_cfc_lr"
+        )
+
+    # If 2D array, then select upper triangle and flatten
     cms[np.isinf(cms) | (cms > np.finfo(np.float64).max)] = 0
     nan_indices = np.isnan(cms).any(axis=0)
 
@@ -189,15 +246,12 @@ def sub_mat_linear_reg(fc, cms):
     # Dominance analysis
     model_metrics, model_r_sq = get_dominance_stats(X, y, use_adjusted_r_sq=False)
     return (
-        0,
-        0,
         model_metrics["total_dominance"],
         model_r_sq[(0, 1, 2, 3, 4)],
-        len(nan_indices),
     )
 
 
-def pg_anova(anova_df, col_name="rsq", factors="Group"):
+def pg_anova(anova_df, col_name="rsq", factor="Group"):
     """
     ANOVA
     Pingouin one-way ANOVA without covariates. Only for all-fiber tractography comparison.
@@ -205,7 +259,7 @@ def pg_anova(anova_df, col_name="rsq", factors="Group"):
     Args:
         anova_df (Pandas df): The dataframe for one-way ANOVA
         col_name (str, optional): The column name to be compared. Defaults to "rsq".
-        factors (str, optional): The column name representing the factor. Defaults to "Group".
+        factor (str, optional): The column name representing the factor. Defaults to "Group".
 
     Returns:
         list: ANOVA and post-hoc results
@@ -215,11 +269,12 @@ def pg_anova(anova_df, col_name="rsq", factors="Group"):
         posthoc["cohen"]
         posthoc["diff"]
     """
-    anova_df[factors] = pd.Categorical(anova_df[factors], categories=DISGROUPS, ordered=True)
-    anova_res = pg.anova(data=anova_df, dv=col_name, between=factors, effsize="np2").round(3)
+    anova_res = pg.anova(data=anova_df, dv=col_name, between=factor, effsize="np2")
     f_statistic = anova_res["F"].iloc[0]
     p_value = anova_res["p-unc"].iloc[0]
-    posthoc = pg.pairwise_gameshowell(data=anova_df, dv=col_name, between=factors, effsize="cohen").round(3)
+    posthoc = pg.pairwise_gameshowell(
+        data=anova_df, dv=col_name, between=factor, effsize="cohen"
+    )
 
     return (
         anova_res,
@@ -230,71 +285,44 @@ def pg_anova(anova_df, col_name="rsq", factors="Group"):
         posthoc["cohen"].to_list(),
         posthoc["diff"].to_list(),
     )
-    
 
-def pg_mix_anova(anova_df, col_name="rsq", within="lm", between="Group", subject="pid"):
+
+def pg_mix_anova(anova_df, col_name="rsq", within="Tractography", between="Group", subject="pid"):
     """
     Mixed ANOVA
     Pingouin mixed ANOVA for INT and WMH tractography comparison.
     Args:
         anova_df (Pandas df): The dataframe for mixed ANOVA
         col_name (str, optional): The column name to be compared. Defaults to "rsq".
-        within (str, optional): The column name representing the within-subject factor. Defaults to "lm".
+        within (str, optional): The column name representing the within-subject factor. Defaults to "Tractography".
         between (str, optional): The column name representing the between-subject factor. Defaults to "Group".
         subject (str, optional): The column name representing the subject. Defaults to "pid".
     Returns:
         list: ANOVA and post-hoc results
-        f_statistic
-        p_value
-        posthoc["pval"]
 
     """
 
-    anova_res = pg.mixed_anova(data=anova_df, dv=col_name, within=within, between=between,
-                                subject=subject, effsize="ng2").round(3)
-    f_statistic = anova_res["F"].iloc
-    p_value = anova_res["p-unc"].iloc
-    # Check for significant interaction of Group 
-    posthoc = None
-    if p_value[0] < 0.05:
-        print("Significant Group effect detected.")
-        
-        for lm_lab in LM_LAB[1:]:
-            lm_anova_df = anova_df[anova_df['lm'] == lm_lab]
-            posthoc = pg.pairwise_gameshowell(data=lm_anova_df, dv='rsq', between='Group', effsize='cohen').round(3)
-            print(f"\nPost-hoc comparisons (averaged across {lm_lab.upper()}-tractography):")
-            display(posthoc)
-            
-    # Check for significant main effect of Tractography
-    # if p_value[1] < 0.05:
-    #     print("Significant main effect of Tractography detected.")
-    #     for group in anova_df['Group'].unique():
-    #         df_group = anova_df[anova_df['Group'] == group]
-    #         pivot_df = df_group.pivot(index='pid', columns='lm', values=col_name)
-            
-    #         # Paired t-test between INT and WMH within each group
-    #         ttest_result = pg.ttest(pivot_df['int'], pivot_df['wmh'], paired=True, correction='auto',
-    #                     alternative='two-sided').round(3)
-    #         display(ttest_result)
-            
-    if p_value[2] < 0.05:
-        print("Significant interaction between LM and Group detected detected.")
-        posthoc = pg.pairwise_gameshowell(data=anova_df, dv=col_name, between=between, effsize="cohen").round(3)
-        print("\nPost-hoc comparisons:")
-        display(posthoc)
-    return (
-        anova_res,
-        posthoc,
-        f_statistic,
-        p_value,
-        posthoc["pval"].to_list() if posthoc is not None else [],
-        posthoc["cohen"].to_list() if posthoc is not None else [],
-        posthoc["diff"].to_list() if posthoc is not None else [],
-    )
-    
-    
+    anova_res = pg.mixed_anova(
+        data=anova_df,
+        dv=col_name,
+        within=within,
+        between=between,
+        subject=subject,
+        effsize="ng2",
+    ).round(3)
+    posthoc_df = pd.DataFrame([])
+    for tract_lab in TRACT_LABS[1:]:
+        lm_anova_df = anova_df[anova_df["Tractography"] == tract_lab]
+        posthoc = pg.pairwise_gameshowell(
+            data=lm_anova_df, dv=col_name, between="Group", effsize="cohen"
+        ).round(3)
+        posthoc["Tractography"] = tract_lab.upper()
+        posthoc_df = pd.concat([posthoc_df, posthoc], ignore_index=True)
+
+    return (anova_res, posthoc_df)
+
+
 def get_yeo7_dict(order_file):
-    
     """
     Get the yeo 7 or 17 subnetwork-node map
 
@@ -312,7 +340,8 @@ def get_yeo7_dict(order_file):
     yeo7_dict = order_tbl.groupby("net")["idx"].apply(list).to_dict()
     return yeo7_dict
 
-def get_mean_matrix(cm_lab, lm="wb"):
+
+def get_mean_matrix(cm_lab, tract_lab="wb"):
     """get the mean matrix for sc, fc and lesion map"""
     mean_mat = np.zeros((NNODE, NNODE, len(DISGROUPS)))
     mean_n = np.zeros(len(DISGROUPS))
@@ -321,7 +350,7 @@ def get_mean_matrix(cm_lab, lm="wb"):
             sub_mat = np.load(f"{PROJ_HOME}/data/fcs/{sub_id}_fc-wb_{ATLAS}.npy")
         else:
             sub_mat = np.load(
-                f"{PROJ_HOME}/data/cm/{cm_lab}/{sub_id}_{lm}_{cm_lab}_{ATLAS}.npy"
+                f"{PROJ_HOME}/data/cm/{cm_lab}/{sub_id}_{tract_lab}_{cm_lab}_{ATLAS}.npy"
             )[0]
 
         mean_idx = DISGROUPS.index(SUB_ID_DIAG_DICT[sub_id])
@@ -428,7 +457,7 @@ def plot_create_image_grid(image_files, nrow, ncol, padding, output_path, is_dlt
 YEO7_DICT = get_yeo7_dict(
     f"{PROJ_HOME}/parc/Schaefer2018_200Parcels_7Networks_order.txt",
 )
-net_abbr = {
+NET_LABS = {
     "Vis": "VN",
     "SomMot": "SMN",
     "DorsAttn": "DAN",
@@ -438,3 +467,17 @@ net_abbr = {
     "Default": "DMN",
 }
 
+
+def fdr_correction(pvals, alpha=0.05):
+    """
+    Perform Benjamini-Hochberg FDR correction on a list of p-values.
+
+    Parameters:
+    pvals (list or np.array): List or array of p-values to correct.
+    alpha (float): Significance level for FDR correction.
+
+    Returns:
+    np.array: Array of corrected p-values.
+    """
+    _, corrected_pvals, _, _ = multipletests(pvals, alpha=alpha, method="fdr_bh")
+    return corrected_pvals
